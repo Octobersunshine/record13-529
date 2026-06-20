@@ -125,3 +125,45 @@ func (s *TaskStore) CronTasks() []*Task {
 	}
 	return result
 }
+
+func (s *TaskStore) RunningTasksByNode(nodeID string) []*Task {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*Task, 0)
+	for _, id := range s.order {
+		t := s.tasks[id]
+		if t.AssignedNode == nodeID && t.Status == TaskStatusRunning {
+			cp := *t
+			result = append(result, &cp)
+		}
+	}
+	return result
+}
+
+func (s *TaskStore) ActiveTasksByNode(nodeID string) []*Task {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	result := make([]*Task, 0)
+	for _, id := range s.order {
+		t := s.tasks[id]
+		if t.AssignedNode == nodeID &&
+			(t.Status == TaskStatusRunning || t.Status == TaskStatusPending) {
+			cp := *t
+			result = append(result, &cp)
+		}
+	}
+	return result
+}
+
+func (s *TaskStore) ResetTaskNode(taskID string) bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	t, ok := s.tasks[taskID]
+	if !ok {
+		return false
+	}
+	t.AssignedNode = ""
+	t.Status = TaskStatusPending
+	t.UpdatedAt = time.Now()
+	return true
+}

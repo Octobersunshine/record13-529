@@ -68,6 +68,14 @@ func (w *WeightedRoundRobin) UpdateWeight(nodeID string, weight int) error {
 	return nil
 }
 
+func (w *WeightedRoundRobin) ResetCurrentWeights() {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	for _, wn := range w.nodeList {
+		wn.CurrentWeight = 0
+	}
+}
+
 func (w *WeightedRoundRobin) Next() (*model.Node, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()

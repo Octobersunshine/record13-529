@@ -18,12 +18,13 @@ func main() {
 	nodeStore := model.NewNodeStore()
 	taskStore := model.NewTaskStore()
 	wrr := scheduler.NewWeightedRoundRobin()
+	rebalancer := scheduler.NewRebalancer(nodeStore, taskStore, wrr)
 	cronMgr := cron.NewCronManager(taskStore, wrr, nodeStore)
 
 	go cronMgr.Start()
 
 	mux := http.NewServeMux()
-	handler := api.NewHandler(nodeStore, taskStore, wrr)
+	handler := api.NewHandler(nodeStore, taskStore, wrr, rebalancer)
 	handler.RegisterRoutes(mux)
 
 	addr := ":8080"
@@ -47,7 +48,13 @@ func main() {
 	fmt.Println("    GET    /api/tasks/{id}     - Get task detail")
 	fmt.Println("    DELETE /api/tasks/{id}     - Delete task")
 	fmt.Println("    POST   /api/dispatch       - Manually dispatch pending tasks")
+	fmt.Println("    POST   /api/rebalance      - Rebalance tasks across nodes")
 	fmt.Println("    GET    /api/stats          - View distribution statistics")
+	fmt.Println()
+	fmt.Println("  Auto-Rebalance Triggers:")
+	fmt.Println("    - Node weight change  -> rebalance PENDING tasks")
+	fmt.Println("    - Node status change  -> rebalance ALL active tasks")
+	fmt.Println("    - Node deletion       -> migrate all tasks before removal")
 	fmt.Println()
 	fmt.Println("  Weighted Round Robin Scheduling:")
 	fmt.Println("    Each node has a configurable weight.")

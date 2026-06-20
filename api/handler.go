@@ -18,16 +18,18 @@ type Response struct {
 }
 
 type Handler struct {
-	nodeStore *model.NodeStore
-	taskStore *model.TaskStore
-	scheduler *scheduler.WeightedRoundRobin
+	nodeStore  *model.NodeStore
+	taskStore  *model.TaskStore
+	scheduler  *scheduler.WeightedRoundRobin
+	rebalancer *scheduler.Rebalancer
 }
 
-func NewHandler(ns *model.NodeStore, ts *model.TaskStore, s *scheduler.WeightedRoundRobin) *Handler {
+func NewHandler(ns *model.NodeStore, ts *model.TaskStore, s *scheduler.WeightedRoundRobin, rb *scheduler.Rebalancer) *Handler {
 	return &Handler{
-		nodeStore: ns,
-		taskStore: ts,
-		scheduler: s,
+		nodeStore:  ns,
+		taskStore:  ts,
+		scheduler:  s,
+		rebalancer: rb,
 	}
 }
 
@@ -43,6 +45,7 @@ func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/tasks", h.handleTasks)
 	mux.HandleFunc("/api/tasks/", h.handleTaskByID)
 	mux.HandleFunc("/api/dispatch", h.handleDispatch)
+	mux.HandleFunc("/api/rebalance", h.handleRebalance)
 	mux.HandleFunc("/api/stats", h.handleStats)
 }
 
@@ -112,6 +115,8 @@ func (h *Handler) handleNodeByID(w http.ResponseWriter, r *http.Request) {
 			writeJSON(w, http.StatusBadRequest, Response{Code: 400, Message: "invalid request body"})
 			return
 		}
+		needRebalance := false
+		var rebalanceIncludeRunning bool
 		node, ok := h.nodeStore.Update(id, func(n *model.Node) {
 			if req.Name != "" {
 				n.Name = req.Name
@@ -119,23 +124,32 @@ func (h *Handler) handleNodeByID(w http.ResponseWriter, r *http.Request) {
 			if req.Weight != nil {
 				n.Weight = *req.Weight
 				h.scheduler.UpdateWeight(id, *req.Weight)
+				needRebalance = true
+				rebalanceIncludeRunning = false
 			}
 			if req.Status != "" {
 				n.Status = model.NodeStatus(req.Status)
 				h.scheduler.Sync(h.nodeStore.OnlineNodes())
+				needRebalance = true
+				rebalanceIncludeRunning = true
 			}
 		})
 		if !ok {
 			writeJSON(w, http.StatusNotFound, Response{Code: 404, Message: "node not found"})
 			return
 		}
+		if needRebalance {
+			go h.rebalancer.Rebalance(rebalanceIncludeRunning)
+		}
 		writeJSON(w, http.StatusOK, Response{Code: 0, Message: "node updated", Data: node})
 
 	case http.MethodDelete:
-		if !h.nodeStore.Delete(id) {
+		if _, ok := h.nodeStore.Get(id); !ok {
 			writeJSON(w, http.StatusNotFound, Response{Code: 404, Message: "node not found"})
 			return
 		}
+		h.rebalancer.RebalanceNode(id, true)
+		h.nodeStore.Delete(id)
 		h.scheduler.RemoveNode(id)
 		writeJSON(w, http.StatusOK, Response{Code: 0, Message: "node deleted"})
 
@@ -264,16 +278,65 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	plan := h.rebalancer.ComputePlan()
+	overloaded := make([]map[string]interface{}, 0)
+	for _, o := range plan.Overloaded {
+		overloaded = append(overloaded, map[string]interface{}{
+			"node_id":        o.NodeID,
+			"name":           o.Name,
+			"weight":         o.Weight,
+			"task_count":     o.TaskCount,
+			"expected_tasks": o.ExpectedTasks,
+			"delta":          o.Delta,
+		})
+	}
+	underloaded := make([]map[string]interface{}, 0)
+	for _, u := range plan.Underloaded {
+		underloaded = append(underloaded, map[string]interface{}{
+			"node_id":        u.NodeID,
+			"name":           u.Name,
+			"weight":         u.Weight,
+			"task_count":     u.TaskCount,
+			"expected_tasks": u.ExpectedTasks,
+			"delta":          u.Delta,
+		})
+	}
+
 	stats := map[string]interface{}{
-		"total_nodes":     len(nodes),
-		"online_nodes":    len(h.nodeStore.OnlineNodes()),
-		"total_tasks":     len(tasks),
-		"task_by_status":  taskStatusCount,
-		"node_allocation": nodeTaskMap,
-		"weight_state":    h.scheduler.Stats(),
+		"total_nodes":      len(nodes),
+		"online_nodes":     len(h.nodeStore.OnlineNodes()),
+		"total_tasks":      len(tasks),
+		"task_by_status":   taskStatusCount,
+		"node_allocation":  nodeTaskMap,
+		"weight_state":     h.scheduler.Stats(),
+		"rebalance_needed": plan.TasksToMigrate,
+		"overloaded_nodes": overloaded,
+		"underloaded_nodes": underloaded,
 	}
 
 	writeJSON(w, http.StatusOK, Response{Code: 0, Message: "ok", Data: stats})
+}
+
+func (h *Handler) handleRebalance(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, Response{Code: 405, Message: "method not allowed"})
+		return
+	}
+
+	var req struct {
+		IncludeRunning bool `json:"include_running,omitempty"`
+	}
+	if r.Body != nil {
+		json.NewDecoder(r.Body).Decode(&req)
+	}
+
+	plan := h.rebalancer.Rebalance(req.IncludeRunning)
+
+	result := map[string]interface{}{
+		"migrated_tasks": plan.TasksToMigrate,
+		"after":          h.rebalancer.ComputePlan(),
+	}
+	writeJSON(w, http.StatusOK, Response{Code: 0, Message: "rebalance completed", Data: result})
 }
 
 func (h *Handler) dispatchTask(task *model.Task) {
