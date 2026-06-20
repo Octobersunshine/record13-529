@@ -29,16 +29,20 @@ func NewWeightedRoundRobin() *WeightedRoundRobin {
 func (w *WeightedRoundRobin) AddNode(node *model.Node) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
+	ew := node.EffectiveWeight
+	if ew <= 0 {
+		ew = node.Weight
+	}
 	if _, exists := w.nodes[node.ID]; exists {
 		wn := w.nodes[node.ID]
-		wn.Weight = node.Weight
+		wn.Weight = ew
 		wn.Node = node
 		return
 	}
 	wn := &WeightedNode{
 		Node:          node,
 		CurrentWeight: 0,
-		Weight:        node.Weight,
+		Weight:        ew,
 	}
 	w.nodes[node.ID] = wn
 	w.nodeList = append(w.nodeList, wn)
@@ -64,7 +68,6 @@ func (w *WeightedRoundRobin) UpdateWeight(nodeID string, weight int) error {
 		return fmt.Errorf("node %s not found", nodeID)
 	}
 	wn.Weight = weight
-	wn.Node.Weight = weight
 	return nil
 }
 
@@ -117,15 +120,19 @@ func (w *WeightedRoundRobin) Sync(nodes []*model.Node) {
 
 	for _, n := range nodes {
 		activeIDs[n.ID] = true
+		ew := n.EffectiveWeight
+		if ew <= 0 {
+			ew = n.Weight
+		}
 		if wn, exists := w.nodes[n.ID]; exists {
 			wn.Node = n
-			wn.Weight = n.Weight
+			wn.Weight = ew
 			newList = append(newList, wn)
 		} else {
 			wn := &WeightedNode{
 				Node:          n,
 				CurrentWeight: 0,
-				Weight:        n.Weight,
+				Weight:        ew,
 			}
 			w.nodes[n.ID] = wn
 			newList = append(newList, wn)

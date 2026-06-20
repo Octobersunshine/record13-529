@@ -13,14 +13,17 @@ const (
 )
 
 type Node struct {
-	ID        string     `json:"id"`
-	Name      string     `json:"name"`
-	Address   string     `json:"address"`
-	Weight    int        `json:"weight"`
-	Status    NodeStatus `json:"status"`
-	TaskCount int        `json:"task_count"`
-	CreatedAt time.Time  `json:"created_at"`
-	UpdatedAt time.Time  `json:"updated_at"`
+	ID              string     `json:"id"`
+	Name            string     `json:"name"`
+	Address         string     `json:"address"`
+	Weight          int        `json:"weight"`
+	EffectiveWeight int        `json:"effective_weight"`
+	Status          NodeStatus `json:"status"`
+	TaskCount       int        `json:"task_count"`
+	CPUUsage        float64    `json:"cpu_usage"`
+	MemUsage        float64    `json:"mem_usage"`
+	CreatedAt       time.Time  `json:"created_at"`
+	UpdatedAt       time.Time  `json:"updated_at"`
 }
 
 type NodeStore struct {

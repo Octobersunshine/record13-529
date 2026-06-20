@@ -11,20 +11,25 @@ import (
 	"task-scheduler/api"
 	"task-scheduler/cron"
 	"task-scheduler/model"
+	"task-scheduler/monitor"
 	"task-scheduler/scheduler"
 )
 
 func main() {
 	nodeStore := model.NewNodeStore()
 	taskStore := model.NewTaskStore()
+	loadStore := model.NewLoadStore()
 	wrr := scheduler.NewWeightedRoundRobin()
 	rebalancer := scheduler.NewRebalancer(nodeStore, taskStore, wrr)
+	monCfg := monitor.DefaultConfig()
+	loadMonitor := monitor.NewLoadMonitor(monCfg, loadStore, nodeStore, wrr, rebalancer)
 	cronMgr := cron.NewCronManager(taskStore, wrr, nodeStore)
 
+	go loadMonitor.Start()
 	go cronMgr.Start()
 
 	mux := http.NewServeMux()
-	handler := api.NewHandler(nodeStore, taskStore, wrr, rebalancer)
+	handler := api.NewHandler(nodeStore, taskStore, wrr, rebalancer, loadMonitor)
 	handler.RegisterRoutes(mux)
 
 	addr := ":8080"
@@ -49,18 +54,23 @@ func main() {
 	fmt.Println("    DELETE /api/tasks/{id}     - Delete task")
 	fmt.Println("    POST   /api/dispatch       - Manually dispatch pending tasks")
 	fmt.Println("    POST   /api/rebalance      - Rebalance tasks across nodes")
+	fmt.Println("    POST   /api/nodes/{id}/load - Report node load (cpu/mem)")
 	fmt.Println("    GET    /api/stats          - View distribution statistics")
 	fmt.Println()
 	fmt.Println("  Auto-Rebalance Triggers:")
-	fmt.Println("    - Node weight change  -> rebalance PENDING tasks")
-	fmt.Println("    - Node status change  -> rebalance ALL active tasks")
-	fmt.Println("    - Node deletion       -> migrate all tasks before removal")
+	fmt.Println("    - Node weight change     -> rebalance PENDING tasks")
+	fmt.Println("    - Node status change     -> rebalance ALL active tasks")
+	fmt.Println("    - Node deletion          -> migrate all tasks before removal")
+	fmt.Println("    - CPU/Mem load change    -> auto-adjust effective weight + rebalance")
 	fmt.Println()
-	fmt.Println("  Weighted Round Robin Scheduling:")
-	fmt.Println("    Each node has a configurable weight.")
-	fmt.Println("    Tasks are distributed proportionally to node weights.")
-	fmt.Println("    Example: node-A(weight=3), node-B(weight=1)")
-	fmt.Println("    -> 75% tasks to A, 25% tasks to B")
+	fmt.Println("  Dynamic Weight (CPU-Aware Scheduling):")
+	fmt.Println("    Nodes report CPU/memory load via POST /api/nodes/{id}/load")
+	fmt.Println("    EffectiveWeight = ConfiguredWeight * cpuFactor * memFactor")
+	fmt.Println("    - CPU < 80%%:  gradual 0-20%% reduction")
+	fmt.Println("    - CPU 80-95%%:  aggressive 50-100%% reduction")
+	fmt.Println("    - CPU >= 95%%: critical, weight drops to minimum")
+	fmt.Println("    EMA smoothing (alpha=0.3) prevents thrashing")
+	fmt.Println("    Stale reports >60s -> revert to configured weight")
 	fmt.Println("============================================")
 
 	sigCh := make(chan os.Signal, 1)
@@ -69,6 +79,7 @@ func main() {
 	go func() {
 		<-sigCh
 		fmt.Println("\nShutting down...")
+		loadMonitor.Stop()
 		cronMgr.Stop()
 		os.Exit(0)
 	}()

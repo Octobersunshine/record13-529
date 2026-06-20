@@ -45,7 +45,11 @@ func (r *Rebalancer) ComputePlan() *RebalancePlan {
 	totalWeight := 0
 	totalTasks := 0
 	for _, n := range nodes {
-		totalWeight += n.Weight
+		w := n.EffectiveWeight
+		if w <= 0 {
+			w = n.Weight
+		}
+		totalWeight += w
 		totalTasks += n.TaskCount
 	}
 	if totalWeight == 0 || totalTasks == 0 {
@@ -60,12 +64,16 @@ func (r *Rebalancer) ComputePlan() *RebalancePlan {
 
 	base := float64(totalTasks) / float64(totalWeight)
 	for _, n := range nodes {
-		expected := base * float64(n.Weight)
+		w := n.EffectiveWeight
+		if w <= 0 {
+			w = n.Weight
+		}
+		expected := base * float64(w)
 		delta := n.TaskCount - int(math.Round(expected))
 		info := &NodeLoadInfo{
 			NodeID:        n.ID,
 			Name:          n.Name,
-			Weight:        n.Weight,
+			Weight:        w,
 			TaskCount:     n.TaskCount,
 			ExpectedTasks: expected,
 			Delta:         delta,

@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"task-scheduler/model"
+	"task-scheduler/monitor"
 	"task-scheduler/scheduler"
 )
 
@@ -22,14 +23,16 @@ type Handler struct {
 	taskStore  *model.TaskStore
 	scheduler  *scheduler.WeightedRoundRobin
 	rebalancer *scheduler.Rebalancer
+	monitor    *monitor.LoadMonitor
 }
 
-func NewHandler(ns *model.NodeStore, ts *model.TaskStore, s *scheduler.WeightedRoundRobin, rb *scheduler.Rebalancer) *Handler {
+func NewHandler(ns *model.NodeStore, ts *model.TaskStore, s *scheduler.WeightedRoundRobin, rb *scheduler.Rebalancer, m *monitor.LoadMonitor) *Handler {
 	return &Handler{
 		nodeStore:  ns,
 		taskStore:  ts,
 		scheduler:  s,
 		rebalancer: rb,
+		monitor:    m,
 	}
 }
 
@@ -41,12 +44,30 @@ func writeJSON(w http.ResponseWriter, code int, resp Response) {
 
 func (h *Handler) RegisterRoutes(mux *http.ServeMux) {
 	mux.HandleFunc("/api/nodes", h.handleNodes)
-	mux.HandleFunc("/api/nodes/", h.handleNodeByID)
+	mux.HandleFunc("/api/nodes/", h.handleNodeSubRoutes)
 	mux.HandleFunc("/api/tasks", h.handleTasks)
 	mux.HandleFunc("/api/tasks/", h.handleTaskByID)
 	mux.HandleFunc("/api/dispatch", h.handleDispatch)
 	mux.HandleFunc("/api/rebalance", h.handleRebalance)
 	mux.HandleFunc("/api/stats", h.handleStats)
+}
+
+func (h *Handler) handleNodeSubRoutes(w http.ResponseWriter, r *http.Request) {
+	path := strings.TrimPrefix(r.URL.Path, "/api/nodes/")
+	if path == "" {
+		h.handleNodes(w, r)
+		return
+	}
+
+	parts := strings.SplitN(path, "/", 2)
+	nodeID := parts[0]
+
+	if len(parts) == 2 && parts[1] == "load" {
+		h.handleNodeLoad(w, r, nodeID)
+		return
+	}
+
+	h.handleNodeByIDInner(w, r, nodeID)
 }
 
 func (h *Handler) handleNodes(w http.ResponseWriter, r *http.Request) {
@@ -73,13 +94,14 @@ func (h *Handler) handleNodes(w http.ResponseWriter, r *http.Request) {
 		}
 		now := time.Now()
 		node := &model.Node{
-			ID:        fmt.Sprintf("node-%d", now.UnixNano()),
-			Name:      req.Name,
-			Address:   req.Address,
-			Weight:    req.Weight,
-			Status:    model.NodeStatusOnline,
-			CreatedAt: now,
-			UpdatedAt: now,
+			ID:              fmt.Sprintf("node-%d", now.UnixNano()),
+			Name:           req.Name,
+			Address:        req.Address,
+			Weight:         req.Weight,
+			EffectiveWeight: req.Weight,
+			Status:         model.NodeStatusOnline,
+			CreatedAt:      now,
+			UpdatedAt:      now,
 		}
 		h.nodeStore.Add(node)
 		h.scheduler.AddNode(node)
@@ -89,12 +111,7 @@ func (h *Handler) handleNodes(w http.ResponseWriter, r *http.Request) {
 	}
 }
 
-func (h *Handler) handleNodeByID(w http.ResponseWriter, r *http.Request) {
-	id := strings.TrimPrefix(r.URL.Path, "/api/nodes/")
-	if id == "" {
-		writeJSON(w, http.StatusBadRequest, Response{Code: 400, Message: "node id is required"})
-		return
-	}
+func (h *Handler) handleNodeByIDInner(w http.ResponseWriter, r *http.Request, id string) {
 
 	switch r.Method {
 	case http.MethodGet:
@@ -123,6 +140,7 @@ func (h *Handler) handleNodeByID(w http.ResponseWriter, r *http.Request) {
 			}
 			if req.Weight != nil {
 				n.Weight = *req.Weight
+				n.EffectiveWeight = *req.Weight
 				h.scheduler.UpdateWeight(id, *req.Weight)
 				needRebalance = true
 				rebalanceIncludeRunning = false
@@ -151,6 +169,7 @@ func (h *Handler) handleNodeByID(w http.ResponseWriter, r *http.Request) {
 		h.rebalancer.RebalanceNode(id, true)
 		h.nodeStore.Delete(id)
 		h.scheduler.RemoveNode(id)
+		h.monitor.RemoveNode(id)
 		writeJSON(w, http.StatusOK, Response{Code: 0, Message: "node deleted"})
 
 	default:
@@ -271,10 +290,13 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 	nodeTaskMap := make(map[string]interface{})
 	for _, n := range nodes {
 		nodeTaskMap[n.ID] = map[string]interface{}{
-			"name":       n.Name,
-			"weight":     n.Weight,
-			"status":     n.Status,
-			"task_count": n.TaskCount,
+			"name":             n.Name,
+			"weight":           n.Weight,
+			"effective_weight": n.EffectiveWeight,
+			"status":           n.Status,
+			"task_count":       n.TaskCount,
+			"cpu_usage":        fmt.Sprintf("%.1f%%", n.CPUUsage),
+			"mem_usage":        fmt.Sprintf("%.1f%%", n.MemUsage),
 		}
 	}
 
@@ -303,15 +325,16 @@ func (h *Handler) handleStats(w http.ResponseWriter, r *http.Request) {
 	}
 
 	stats := map[string]interface{}{
-		"total_nodes":      len(nodes),
-		"online_nodes":     len(h.nodeStore.OnlineNodes()),
-		"total_tasks":      len(tasks),
-		"task_by_status":   taskStatusCount,
-		"node_allocation":  nodeTaskMap,
-		"weight_state":     h.scheduler.Stats(),
-		"rebalance_needed": plan.TasksToMigrate,
-		"overloaded_nodes": overloaded,
+		"total_nodes":       len(nodes),
+		"online_nodes":      len(h.nodeStore.OnlineNodes()),
+		"total_tasks":       len(tasks),
+		"task_by_status":    taskStatusCount,
+		"node_allocation":   nodeTaskMap,
+		"weight_state":      h.scheduler.Stats(),
+		"rebalance_needed":  plan.TasksToMigrate,
+		"overloaded_nodes":  overloaded,
 		"underloaded_nodes": underloaded,
+		"load_monitor":      h.monitor.Stats(),
 	}
 
 	writeJSON(w, http.StatusOK, Response{Code: 0, Message: "ok", Data: stats})
@@ -337,6 +360,65 @@ func (h *Handler) handleRebalance(w http.ResponseWriter, r *http.Request) {
 		"after":          h.rebalancer.ComputePlan(),
 	}
 	writeJSON(w, http.StatusOK, Response{Code: 0, Message: "rebalance completed", Data: result})
+}
+
+func (h *Handler) handleNodeLoad(w http.ResponseWriter, r *http.Request, nodeID string) {
+	if r.Method != http.MethodPost {
+		writeJSON(w, http.StatusMethodNotAllowed, Response{Code: 405, Message: "method not allowed"})
+		return
+	}
+
+	if _, ok := h.nodeStore.Get(nodeID); !ok {
+		writeJSON(w, http.StatusNotFound, Response{Code: 404, Message: "node not found"})
+		return
+	}
+
+	var req struct {
+		CPUUsage    float64 `json:"cpu_usage"`
+		MemUsage    float64 `json:"mem_usage"`
+		LoadAvg1    float64 `json:"load_avg_1,omitempty"`
+		LoadAvg5    float64 `json:"load_avg_5,omitempty"`
+		LoadAvg15   float64 `json:"load_avg_15,omitempty"`
+		ActiveConns int     `json:"active_conns,omitempty"`
+	}
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, Response{Code: 400, Message: "invalid request body"})
+		return
+	}
+
+	if req.CPUUsage < 0 || req.CPUUsage > 100 {
+		writeJSON(w, http.StatusBadRequest, Response{Code: 400, Message: "cpu_usage must be 0-100"})
+		return
+	}
+	if req.MemUsage < 0 || req.MemUsage > 100 {
+		writeJSON(w, http.StatusBadRequest, Response{Code: 400, Message: "mem_usage must be 0-100"})
+		return
+	}
+
+	report := &model.LoadReport{
+		NodeID:      nodeID,
+		CPUUsage:    req.CPUUsage,
+		MemUsage:    req.MemUsage,
+		LoadAvg1:    req.LoadAvg1,
+		LoadAvg5:    req.LoadAvg5,
+		LoadAvg15:   req.LoadAvg15,
+		ActiveConns: req.ActiveConns,
+	}
+
+	h.monitor.ReportLoad(report)
+
+	node, _ := h.nodeStore.Get(nodeID)
+	writeJSON(w, http.StatusOK, Response{
+		Code:    0,
+		Message: "load reported",
+		Data: map[string]interface{}{
+			"node_id":          nodeID,
+			"cpu_usage":        req.CPUUsage,
+			"mem_usage":        req.MemUsage,
+			"configured_weight": node.Weight,
+			"effective_weight": node.EffectiveWeight,
+		},
+	})
 }
 
 func (h *Handler) dispatchTask(task *model.Task) {
